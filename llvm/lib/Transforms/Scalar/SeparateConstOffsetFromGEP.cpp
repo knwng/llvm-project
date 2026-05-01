@@ -434,6 +434,21 @@ private:
 
   bool hasMoreThanOneUseInLoop(Value *v, Loop *L);
 
+  /// Rewrite a padded-layout address pattern in a GEP index to expose hidden
+  /// constant offsets. Matches: add(and(lshr(V, s), mask), V) where
+  /// V = or_disjoint(base, C). The and(lshr(V, s), mask) term computes the
+  /// padding adjustment for a shared-memory padded layout. Rewrites to
+  /// add(f(base), TotalConst) where TotalConst = C + ((C >> s) & mask).
+  bool rewritePaddedLayoutAddrInGEP(GetElementPtrInst *GEP);
+
+  /// Rewrite a standalone padding-adjustment GEP index of the form
+  /// and(lshr(or_disjoint(X, C), s), mask) to
+  /// add(and(lshr(X, s), mask), (C >> s) & mask), exposing the hidden
+  /// constant padding offset for extraction. This handles two-level GEP
+  /// chains where the padding adjustment is a separate GEP index from the
+  /// logical address.
+  bool rewritePaddingAdjustmentInGEP(GetElementPtrInst *GEP);
+
   // Swap the index operand of two GEP.
   void swapGEPOperand(GetElementPtrInst *First, GetElementPtrInst *Second);
 
@@ -1085,6 +1100,185 @@ bool SeparateConstOffsetFromGEP::reorderGEP(GetElementPtrInst *GEP,
   return true;
 }
 
+bool SeparateConstOffsetFromGEP::rewritePaddedLayoutAddrInGEP(
+    GetElementPtrInst *GEP) {
+  bool Changed = false;
+  gep_type_iterator GTI = gep_type_begin(*GEP);
+  for (unsigned I = 1, E = GEP->getNumOperands(); I != E; ++I, ++GTI) {
+    if (!GTI.isSequential())
+      continue;
+    if (GTI.getIndexedType()->isScalableTy())
+      continue;
+
+    Value *Idx = GEP->getOperand(I);
+    auto *AddOp = dyn_cast<BinaryOperator>(Idx);
+    if (!AddOp || AddOp->getOpcode() != Instruction::Add)
+      continue;
+
+    // Match: add(and(lshr(V, shift_const), mask_const), V)
+    // The same V must appear as both the lshr input and the other add operand.
+    Value *V = nullptr;
+    const APInt *ShiftAmt = nullptr;
+    const APInt *MaskVal = nullptr;
+    bool LshrIsExact = false;
+
+    for (unsigned OpIdx = 0; OpIdx < 2; ++OpIdx) {
+      Value *MaybeSwizzle = AddOp->getOperand(OpIdx);
+      Value *MaybeV = AddOp->getOperand(1 - OpIdx);
+      Value *LshrInput = nullptr;
+      const APInt *TryShift = nullptr, *TryMask = nullptr;
+
+      if (match(MaybeSwizzle,
+                m_c_And(m_LShr(m_Value(LshrInput), m_APInt(TryShift)),
+                        m_APInt(TryMask))) &&
+          LshrInput == MaybeV) {
+        V = MaybeV;
+        ShiftAmt = TryShift;
+        MaskVal = TryMask;
+        // Retrieve the exact flag from the original lshr. The lshr may be
+        // on either side of the And due to m_c_And matching.
+        if (auto *AndI = dyn_cast<BinaryOperator>(MaybeSwizzle))
+          for (unsigned K = 0; K < 2; ++K)
+            if (auto *LshrI =
+                    dyn_cast<PossiblyExactOperator>(AndI->getOperand(K)))
+              if (LshrI->getOpcode() == Instruction::LShr) {
+                LshrIsExact = LshrI->isExact();
+                break;
+              }
+        break;
+      }
+    }
+    if (!V)
+      continue;
+
+    // V must be or_disjoint(base, C) where C is a non-zero constant.
+    auto *OrOp = dyn_cast<BinaryOperator>(V);
+    if (!OrOp || OrOp->getOpcode() != Instruction::Or ||
+        !cast<PossiblyDisjointInst>(OrOp)->isDisjoint())
+      continue;
+
+    Value *Base = nullptr;
+    const APInt *CVal = nullptr;
+    if (match(OrOp, m_Or(m_Value(Base), m_APInt(CVal)))) {
+      // ok
+    } else if (match(OrOp, m_Or(m_APInt(CVal), m_Value(Base)))) {
+      // ok
+    } else {
+      continue;
+    }
+
+    if (CVal->isZero())
+      continue;
+
+    // Correctness: since V = base | C with the disjoint flag, base and C
+    // share no bits. Right-shifting preserves bit-disjointness, and AND
+    // distributes over OR, so the padding term decomposes as:
+    //   and(lshr(base | C, s), mask)
+    //     = and(lshr(base, s) | lshr(C, s), mask)
+    //     = and(lshr(base, s), mask) | and(lshr(C, s), mask)
+    //     = and(lshr(base, s), mask) + (C >> s) & mask
+    // (the last step holds because shifted disjoint values remain disjoint).
+    //
+    // Therefore the full padded address decomposes as:
+    //   add(and(lshr(base | C, s), mask), base | C)
+    //     = add(and(lshr(base, s), mask), base) + C + (C >> s) & mask
+
+    unsigned ShiftAmtVal = ShiftAmt->getZExtValue();
+    APInt PaddingConst = CVal->lshr(ShiftAmtVal) & (*MaskVal);
+    APInt TotalConst = *CVal + PaddingConst;
+
+    // Build: f(base) = add(and(lshr(base, s), mask), base)
+    IRBuilder<> Builder(GEP);
+    Value *NewShift = Builder.CreateLShr(
+        Base, ConstantInt::get(Idx->getType(), *ShiftAmt), "", LshrIsExact);
+    Value *NewMask =
+        Builder.CreateAnd(NewShift, ConstantInt::get(Idx->getType(), *MaskVal));
+    Value *NewBase = Builder.CreateAdd(NewMask, Base);
+    Value *NewIdx =
+        Builder.CreateAdd(NewBase, ConstantInt::get(Idx->getType(), TotalConst));
+
+    GEP->setOperand(I, NewIdx);
+    RecursivelyDeleteTriviallyDeadInstructions(Idx);
+    Changed = true;
+  }
+  return Changed;
+}
+
+bool SeparateConstOffsetFromGEP::rewritePaddingAdjustmentInGEP(
+    GetElementPtrInst *GEP) {
+  bool Changed = false;
+  gep_type_iterator GTI = gep_type_begin(*GEP);
+  for (unsigned I = 1, E = GEP->getNumOperands(); I != E; ++I, ++GTI) {
+    if (!GTI.isSequential())
+      continue;
+    if (GTI.getIndexedType()->isScalableTy())
+      continue;
+
+    Value *Idx = GEP->getOperand(I);
+
+    // Match: and(lshr(or_disjoint(X, C), shift_const), mask_const)
+    // where C is a non-zero constant.
+    Value *LshrInput = nullptr;
+    const APInt *ShiftAmt = nullptr;
+    const APInt *MaskVal = nullptr;
+
+    if (!match(Idx, m_c_And(m_LShr(m_Value(LshrInput), m_APInt(ShiftAmt)),
+                            m_APInt(MaskVal))))
+      continue;
+
+    auto *OrOp = dyn_cast<BinaryOperator>(LshrInput);
+    if (!OrOp || OrOp->getOpcode() != Instruction::Or ||
+        !cast<PossiblyDisjointInst>(OrOp)->isDisjoint())
+      continue;
+
+    Value *Base = nullptr;
+    const APInt *CVal = nullptr;
+    if (match(OrOp, m_Or(m_Value(Base), m_APInt(CVal)))) {
+      // ok
+    } else if (match(OrOp, m_Or(m_APInt(CVal), m_Value(Base)))) {
+      // ok
+    } else {
+      continue;
+    }
+
+    if (CVal->isZero())
+      continue;
+
+    unsigned ShiftAmtVal = ShiftAmt->getZExtValue();
+    APInt PaddingConst = CVal->lshr(ShiftAmtVal) & (*MaskVal);
+    if (PaddingConst.isZero())
+      continue;
+
+    // Retrieve the exact flag from the original lshr.
+    bool LshrIsExact = false;
+    if (auto *AndI = dyn_cast<BinaryOperator>(Idx))
+      for (unsigned K = 0; K < 2; ++K)
+        if (auto *LshrI =
+                dyn_cast<PossiblyExactOperator>(AndI->getOperand(K)))
+          if (LshrI->getOpcode() == Instruction::LShr) {
+            LshrIsExact = LshrI->isExact();
+            break;
+          }
+
+    // The padding adjustment decomposes via bit-disjointness:
+    //   and(lshr(or_disjoint(X, C), s), mask)
+    //     = and(lshr(X, s) | lshr(C, s), mask)
+    //     = and(lshr(X, s), mask) + (C >> s) & mask
+    IRBuilder<> Builder(GEP);
+    Value *NewShift = Builder.CreateLShr(
+        Base, ConstantInt::get(Idx->getType(), *ShiftAmt), "", LshrIsExact);
+    Value *NewAnd =
+        Builder.CreateAnd(NewShift, ConstantInt::get(Idx->getType(), *MaskVal));
+    Value *NewIdx =
+        Builder.CreateAdd(NewAnd, ConstantInt::get(Idx->getType(), PaddingConst));
+
+    GEP->setOperand(I, NewIdx);
+    RecursivelyDeleteTriviallyDeadInstructions(Idx);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool SeparateConstOffsetFromGEP::splitGEP(GetElementPtrInst *GEP) {
   // Skip vector GEPs.
   if (GEP->getType()->isVectorTy())
@@ -1108,6 +1302,16 @@ bool SeparateConstOffsetFromGEP::splitGEP(GetElementPtrInst *GEP) {
     return false;
 
   bool Changed = canonicalizeArrayIndicesToIndexSize(GEP);
+
+  // Rewrite padded-layout address patterns like add(and(lshr(V, s), mask), V)
+  // where V = or_disjoint(base, C) to expose the full constant offset,
+  // enabling better base sharing across loads with padded shared memory.
+  Changed |= rewritePaddedLayoutAddrInGEP(GEP);
+
+  // Rewrite standalone padding-adjustment indices and(lshr(or_disjoint(X, C),
+  // s), mask) to expose the hidden constant (C >> s) & mask. This handles
+  // two-level GEP chains where the padding adjustment is a separate index.
+  Changed |= rewritePaddingAdjustmentInGEP(GEP);
 
   bool NeedsExtraction, OffsetOverflow;
   APInt NonBaseByteOffset =

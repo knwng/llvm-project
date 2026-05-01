@@ -8,24 +8,23 @@
 
 define void @large_base_offset(ptr addrspace(1) writeonly %out, i32 %idx) {
 ; CHECK-LABEL: define void @large_base_offset(
-; CHECK-SAME: ptr addrspace(1) writeonly [[TMP0:%.*]], i32 [[TMP1:%.*]]) #[[ATTR0:[0-9]+]] {
+; CHECK-SAME: ptr addrspace(1) writeonly [[OUT:%.*]], i32 [[IDX:%.*]]) #[[ATTR0:[0-9]+]] {
 ; CHECK-NEXT:  [[ENTRY:.*:]]
-; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[TMP1]], 15
+; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[IDX]], 15
 ; CHECK-NEXT:    [[TMP3:%.*]] = shl nuw nsw i32 [[TMP2]], 10
-; CHECK-NEXT:    [[TMP4:%.*]] = and i32 [[TMP1]], 16
+; CHECK-NEXT:    [[TMP4:%.*]] = and i32 [[IDX]], 16
 ; CHECK-NEXT:    [[TMP5:%.*]] = shl nuw nsw i32 [[TMP4]], 1
 ; CHECK-NEXT:    [[TMP6:%.*]] = or disjoint i32 [[TMP5]], [[TMP3]]
 ; CHECK-NEXT:    [[TMP7:%.*]] = shl nuw nsw i32 [[TMP2]], 5
 ; CHECK-NEXT:    [[TMP8:%.*]] = getelementptr i8, ptr addrspace(3) @global_smem, i32 67584
-; CHECK-NEXT:    [[TMP9:%.*]] = or disjoint i32 [[TMP6]], 16384
-; CHECK-NEXT:    [[TMP10:%.*]] = lshr exact i32 [[TMP9]], 5
+; CHECK-NEXT:    [[TMP0:%.*]] = getelementptr inbounds nuw i8, ptr addrspace(3) [[TMP8]], i32 [[TMP6]]
+; CHECK-NEXT:    [[TMP10:%.*]] = lshr exact i32 [[TMP6]], 5
 ; CHECK-NEXT:    [[TMP11:%.*]] = and i32 [[TMP10]], 992
-; CHECK-NEXT:    [[TMP12:%.*]] = getelementptr inbounds nuw i8, ptr addrspace(3) [[TMP8]], i32 [[TMP6]]
-; CHECK-NEXT:    [[TMP13:%.*]] = getelementptr inbounds nuw i8, ptr addrspace(3) [[TMP12]], i32 [[TMP11]]
-; CHECK-NEXT:    [[TMP14:%.*]] = getelementptr inbounds nuw i8, ptr addrspace(3) [[TMP13]], i32 16384
+; CHECK-NEXT:    [[TMP9:%.*]] = getelementptr inbounds i8, ptr addrspace(3) [[TMP0]], i32 [[TMP11]]
+; CHECK-NEXT:    [[TMP14:%.*]] = getelementptr inbounds i8, ptr addrspace(3) [[TMP9]], i32 16896
 ; CHECK-NEXT:    [[TMP15:%.*]] = load <16 x half>, ptr addrspace(3) [[TMP14]], align 32
 ; CHECK-NEXT:    [[TMP16:%.*]] = shufflevector <16 x half> [[TMP15]], <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
-; CHECK-NEXT:    store <8 x half> [[TMP16]], ptr addrspace(1) [[TMP0]], align 16
+; CHECK-NEXT:    store <8 x half> [[TMP16]], ptr addrspace(1) [[OUT]], align 16
 ; CHECK-NEXT:    ret void
 ;
 entry:
@@ -49,23 +48,22 @@ entry:
 
 define void @small_base_offset(ptr addrspace(1) writeonly %out, i32 %idx) {
 ; CHECK-LABEL: define void @small_base_offset(
-; CHECK-SAME: ptr addrspace(1) writeonly [[TMP0:%.*]], i32 [[TMP1:%.*]]) #[[ATTR0]] {
+; CHECK-SAME: ptr addrspace(1) writeonly [[OUT:%.*]], i32 [[IDX:%.*]]) #[[ATTR0]] {
 ; CHECK-NEXT:  [[ENTRY:.*:]]
-; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[TMP1]], 15
+; CHECK-NEXT:    [[TMP2:%.*]] = and i32 [[IDX]], 15
 ; CHECK-NEXT:    [[TMP3:%.*]] = shl nuw nsw i32 [[TMP2]], 10
-; CHECK-NEXT:    [[TMP4:%.*]] = and i32 [[TMP1]], 16
+; CHECK-NEXT:    [[TMP4:%.*]] = and i32 [[IDX]], 16
 ; CHECK-NEXT:    [[TMP5:%.*]] = shl nuw nsw i32 [[TMP4]], 1
 ; CHECK-NEXT:    [[TMP6:%.*]] = or disjoint i32 [[TMP5]], [[TMP3]]
 ; CHECK-NEXT:    [[TMP7:%.*]] = shl nuw nsw i32 [[TMP2]], 5
-; CHECK-NEXT:    [[TMP8:%.*]] = or disjoint i32 [[TMP6]], 16384
-; CHECK-NEXT:    [[TMP9:%.*]] = lshr exact i32 [[TMP8]], 5
-; CHECK-NEXT:    [[TMP10:%.*]] = and i32 [[TMP9]], 992
 ; CHECK-NEXT:    [[TMP11:%.*]] = getelementptr i8, ptr addrspace(3) @global_smem, i32 [[TMP6]]
+; CHECK-NEXT:    [[TMP9:%.*]] = lshr exact i32 [[TMP6]], 5
+; CHECK-NEXT:    [[TMP10:%.*]] = and i32 [[TMP9]], 992
 ; CHECK-NEXT:    [[TMP12:%.*]] = getelementptr i8, ptr addrspace(3) [[TMP11]], i32 [[TMP10]]
-; CHECK-NEXT:    [[TMP13:%.*]] = getelementptr i8, ptr addrspace(3) [[TMP12]], i32 16388
+; CHECK-NEXT:    [[TMP13:%.*]] = getelementptr i8, ptr addrspace(3) [[TMP12]], i32 16900
 ; CHECK-NEXT:    [[TMP14:%.*]] = load <16 x half>, ptr addrspace(3) [[TMP13]], align 32
 ; CHECK-NEXT:    [[TMP15:%.*]] = shufflevector <16 x half> [[TMP14]], <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
-; CHECK-NEXT:    store <8 x half> [[TMP15]], ptr addrspace(1) [[TMP0]], align 16
+; CHECK-NEXT:    store <8 x half> [[TMP15]], ptr addrspace(1) [[OUT]], align 16
 ; CHECK-NEXT:    ret void
 ;
 entry:
